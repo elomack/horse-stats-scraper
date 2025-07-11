@@ -105,7 +105,3 @@ bq query --nouse_legacy_sql \
 • Cloud Run & Functions logs contain detailed `console.log` steps for each batch, merge, clean, and ingest.
 • Cloud Workflows UI shows step-by-step status and any retries.
 • Configure Cloud Monitoring alerts on Workflow failures or ingestion errors.
-
----
-
-This structure and documentation ensure that each component can be deployed, tested, and maintained independently while fitting into the overall orchestrated pipeline.
