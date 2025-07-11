@@ -1,0 +1,12 @@
+{
+  "name": "trigger-function",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "npx @google-cloud/functions-framework --target=trigger"
+  },
+  "dependencies": {
+    "@google-cloud/run": "^2.1.0",
+    "@google-cloud/functions-framework": "^3.1.3"
+  }
+}

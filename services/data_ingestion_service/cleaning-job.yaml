@@ -1,0 +1,20 @@
+apiVersion: run.googleapis.com/v1
+kind: Job
+metadata:
+  name: clean-master-job
+spec:
+  template:
+    # First “template” level holds Job-wide settings
+    template:
+      # Second “template.spec” is exactly where containers + restartPolicy go
+      spec:
+        containers:
+          - image: gcr.io/horse-racing-predictor-465217/data-ingestion-service:latest
+            # override the ENTRYPOINT/CMD so we run our cleaning script
+            command:
+              - node
+              - src/cleanMaster.js
+            args:
+              - horse-racing-data-elomack
+              - horse_data/master_horse_data_2025-07-11_09:12:50.ndjson
+        restartPolicy: Never

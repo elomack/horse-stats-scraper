@@ -1,0 +1,16 @@
+# workflows/scrape-and-merge.yaml
+
+main:
+  steps:
+
+    # 1) Invoke the orchestrator service
+    - invokeOrchestrator:
+        call: http.get
+        args:
+          url: "https://orchestrator-550937617308.europe-central2.run.app"
+        result: orchResp
+        next: done
+
+    # 2) Finish and return the orchestrator’s response body
+    - done:
+        return: ${ orchResp.body }
