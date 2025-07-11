@@ -21,7 +21,7 @@ This service fetches horse data (including career and race details) from the ext
 — a **service-account JSON key**, set via `GOOGLE_APPLICATION_CREDENTIALS`
 — **Docker** (if you plan to containerize)
 
-## C. Project Structure
+## C. Project Structure 
 
 ```
 data_scraper_service/
