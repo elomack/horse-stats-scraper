@@ -13,7 +13,7 @@ This service fetches horse data (including career and race details) from the ext
 — **Outputs NDJSON** to GCS under
 `horse_data/horse_data_<start>_to_<end>_<timestamp>.ndjson`
 
-## B. Prerequisites
+## B. Prerequisites 
 
 — **Node.js** v18+ and **npm**
 — **Google Cloud SDK** (`gcloud`) authenticated to your project
