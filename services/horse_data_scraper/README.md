@@ -1,101 +1,79 @@
 # Horse Data Scraper Service
 
-This service fetches horse data (including career and race details) from the external Homas API, normalizes it, and writes newline-delimited JSON (NDJSON) files into a Google Cloud Storage bucket.
+This service fetches horse racing data in ID-based batches from an external API and writes the results as NDJSON files into a Google Cloud Storage bucket.
 
-## A. Features
+## A. Structure
 
-— **Concurrent fetching** up to `CONCURRENCY_LIMIT` horses at a time
-— **Automatic retries** with backoff on non-404 errors
-— **404 handling:** skips missing IDs without failing the batch
-— **Normalization:**
-— merges partial career records when `raceYear` is null
-— flattens race fields into a clean schema
-— **Outputs NDJSON** to GCS under
-`horse_data/horse_data_<start>_to_<end>_<timestamp>.ndjson`
+- **src/index.js**  
+  Main scraper logic. Accepts `startId` and `batchSize` arguments, fetches horse records in parallel (with retry/back-off), normalizes career and race data, and writes a newline-delimited JSON file to GCS.
 
-## B. Prerequisites 
+- **Dockerfile**  
+  Defines the container image for Cloud Run Job execution.
 
-— **Node.js** v18+ and **npm**
-— **Google Cloud SDK** (`gcloud`) authenticated to your project
-— a **GCS bucket** (e.g. `horse-racing-data-elomack`) with write permissions
-— a **service-account JSON key**, set via `GOOGLE_APPLICATION_CREDENTIALS`
-— **Docker** (if you plan to containerize)
+- **package.json**  
+  Lists Node.js dependencies (`axios`, `@google-cloud/storage`, etc.) and entrypoint scripts.
 
-## C. Project Structure
+## B. Configuration
 
+– Bucket name is set in `src/index.js` as `BUCKET_NAME`  
+– Concurrency limit for HTTP calls: `CONCURRENCY_LIMIT` (default 10)  
+– Default batch parameters:  
+  - `startId` = 1  
+  - `batchSize` = 1000  
+  These can be overridden via command-line arguments.
+
+## C. Build & Push
+
+```powershell
+cd services/horse_data_scraper
+
+docker build `
+  --tag gcr.io/<PROJECT_ID>/horse-data-scraper:latest `
+  .
+
+docker push gcr.io/<PROJECT_ID>/horse-data-scraper:latest
+````
+
+*or using Cloud Build*
+
+```powershell
+gcloud builds submit `
+  --tag gcr.io/<PROJECT_ID>/horse-data-scraper:latest
 ```
-data_scraper_service/
-├── src/
-│   └── index.js        # main scraper logic
-├── Dockerfile
-├── package.json
-└── package-lock.json
+
+## D. Deploy as Cloud Run Job
+
+```powershell
+gcloud beta run jobs create horse-data-scraper-job `
+  --region=<REGION> `
+  --image=gcr.io/<PROJECT_ID>/horse-data-scraper:latest `
+  --command node `
+  --args src/index.js,${startId},${batchSize} `
+  --tasks=1 `
+  --memory=512Mi `
+  --task-timeout=3600s
 ```
 
-## D. Configuration
+– Replace `<PROJECT_ID>` and `<REGION>` with your values
 
-— BUCKET\_NAME: GCS bucket to write NDJSON files (e.g. horse-racing-data-elomack) \[Required]
-— CONCURRENCY\_LIMIT: Max parallel HTTP fetches \[Default: 10]
-— GOOGLE\_APPLICATION\_CREDENTIALS: Path to your service-account JSON key \[Required]
+## E. Trigger a Batch
 
-You can override `CONCURRENCY_LIMIT` at runtime by exporting a different environment variable.
+```powershell
+gcloud beta run jobs execute horse-data-scraper-job `
+  --region=<REGION> `
+  --args=1,1000
+```
 
-## E. Local Usage
+This starts processing IDs 1–1000. For subsequent batches, adjust the `--args` accordingly (e.g. `1001,1000`, etc.).
 
-a. install dependencies
-cd services/data\_scraper\_service
-npm install
+## F. Logs & Monitoring
 
-b. export your credentials
-set GOOGLE\_APPLICATION\_CREDENTIALS=path\to\horse-stats-scraper-sa.json
+– View batch logs in Cloud Run → Jobs → Executions.
+– Key log messages:
 
-c. run a batch (IDs 1–1000)
-node src\index.js 1 1000
+* `Starting scrape batch: IDs X to Y`
+* `Fetched horse <ID>: <name>`
+* `Batch upload complete: gs://<bucket>/<fileName>`
+* Warnings for 404s and retries
 
-After completion, check your bucket:
-`gs://horse-racing-data-elomack/horse_data/horse_data_1_to_1000_<timestamp>.ndjson`
-
-## F. Docker Usage
-
-a. build the image
-cd services/data\_scraper\_service
-docker build -t horse-data-scraper\:latest .
-
-b. run the container
-docker run --rm ^
--e GOOGLE\_APPLICATION\_CREDENTIALS=/app/key.json ^
--v C:\local\path\to\key.json:/app/key.json ^
-horse-data-scraper\:latest 1 1000
-
-## G. Cloud Run Job Deployment
-
-a. build & push your container
-(to `gcr.io/your-project-id/horse-data-scraper:latest`)
-
-b. create a Cloud Run job
-gcloud beta run jobs create horse-data-scraper-job ^
-\--image=gcr.io/your-project-id/horse-data-scraper\:latest ^
-\--region=europe-central2 ^
-\--set-env-vars=BUCKET\_NAME=horse-racing-data-elomack,CONCURRENCY\_LIMIT=10
-
-c. execute for IDs 1–1000
-gcloud beta run jobs execute horse-data-scraper-job ^
-\--region=europe-central2 --args=1,1000
-
-## H. Error Handling & Retries
-
-— **404s:** API 404 responses are logged and skipped
-— **Retries:** other HTTP errors trigger a 2 s delay and retry
-— **Exit codes:**
-— `0` — normal completion
-— `2` — after 10 consecutive 404s (signals “end of data” to orchestrator)
-
-## I. Contributing
-
-— fork the repository
-— create a feature branch
-— submit a pull request with clear descriptions and tests
-
-## J. License
-
-MIT © Your Name
+These logs allow you to trace each batch’s progress and diagnose any fetch failures.

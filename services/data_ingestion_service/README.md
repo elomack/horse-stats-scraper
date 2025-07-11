@@ -1,93 +1,119 @@
-# Horse Data Ingestion Service
+# Data Ingestion Service
 
-This service loads NDJSON horse-data files from Google Cloud Storage into BigQuery. It creates a transient staging table, imports the data, merges it into the main table (setting `updated_at`), and then cleans up the staging table.
+This service merges, cleans, de-duplicates, and ingests newline-delimited JSON (NDJSON) horse data into BigQuery via three Cloud Run Jobs.
 
-## A. Prerequisites
+## A. Structure
 
-— **Node.js** v18+ and **npm**
-— **Google Cloud SDK** (`gcloud`) authenticated to your project
-— A **BigQuery dataset** (`horse_racing_data`) and **main table** (`horse_records`) pre-created
-— A **service-account JSON key**, set via `GOOGLE_APPLICATION_CREDENTIALS`
-— **Docker** (if you plan to containerize)
+— **src/index.js**  
+ Loads a cleaned master NDJSON from GCS into BigQuery:  
+ ∙ stages into a transient table  
+ ∙ performs a MERGE upsert into `horse_records`  
+ ∙ sets `updated_at = CURRENT_TIMESTAMP()`  
 
-## B. Project Structure
+— **src/cleanMaster.js**  
+ Streams the master NDJSON from GCS, drops malformed JSON lines, removes duplicate `id` entries, and writes a cleaned/​deduped file back to GCS  
 
-data\_ingestion\_service/
-├── src/
-│   ├── entrypoint.js   # parses CLI args & invokes ingestHorseData
-│   └── index.js        # BigQuery load → merge → delete logic
-├── Dockerfile
-├── package.json
-└── package-lock.json
+— **src/mergeMaster.js** (if separate)  
+ Gathers all batch NDJSON files under `horse_data/`, concatenates them into a single `master_…ndjson`, and deletes the original batch files  
 
-## C. Configuration
+— **Dockerfile**  
+ Builds a container image for all three jobs  
 
-— `GOOGLE_APPLICATION_CREDENTIALS`: Path to service-account JSON key \[Required]
-— `PROJECT_ID`: GCP Project ID (`horse-racing-predictor-465217`) \[Set in code]
-— `DATASET_ID`: BigQuery dataset (`horse_racing_data`) \[Set in code]
-— `MAIN_TABLE`: Fully-qualified main table name \[Set in code]
+— **package.json**  
+ CommonJS mode; dependencies on `@google-cloud/storage` and `@google-cloud/bigquery`
 
-## D. Local Usage
+## B. Jobs & Usage
 
-a. Install dependencies
-cd services/data\_ingestion\_service
-npm install
+— **Merge Job**  
+```powershell
+gcloud beta run jobs create merge-job `
+  --region=<REGION> `
+  --image=gcr.io/<PROJECT_ID>/data-ingestion-service:latest `
+  --command node `
+  --args=src/mergeMaster.js,horse-racing-data-<PROJECT_ID> `
+  --tasks=1 --memory=256Mi --task-timeout=600s
+````
 
-b. Export your credentials
-set GOOGLE\_APPLICATION\_CREDENTIALS=path\to\horse-stats-scraper-sa.json
+— **Clean & Dedupe Job**
 
-c. Run ingestion
-node src\entrypoint.js horse-racing-data-elomack horse\_data/horse\_data\_1\_to\_1000\_<timestamp>.ndjson
+```powershell
+gcloud beta run jobs create clean-master-job `
+  --region=<REGION> `
+  --image=gcr.io/<PROJECT_ID>/data-ingestion-service:latest `
+  --command node `
+  --args=src/cleanMaster.js,horse-racing-data-<PROJECT_ID>,horse_data/master_*.ndjson `
+  --tasks=1 --memory=512Mi --task-timeout=600s
+```
 
-## E. Docker Usage
+— **Ingestion Job**
 
-a. Build the image
-cd services/data\_ingestion\_service
-docker build -t horse-data-ingestion\:latest .
+```powershell
+gcloud beta run jobs create horse-ingestion-job `
+  --region=<REGION> `
+  --image=gcr.io/<PROJECT_ID>/data-ingestion-service:latest `
+  --command node `
+  --args=src/index.js,horse-racing-data-<PROJECT_ID>,horse_data/*.ndjson `
+  --tasks=1 --memory=512Mi --task-timeout=600s
+```
 
-b. Run the container
-docker run --rm ^
--e GOOGLE\_APPLICATION\_CREDENTIALS=/app/key.json ^
--v C:\local\key.json:/app/key.json ^
-horse-data-ingestion\:latest ^
-horse-racing-data-elomack ^
-horse\_data/horse\_data\_1\_to\_1000\_<timestamp>.ndjson
+Replace `<PROJECT_ID>` and `<REGION>` as needed. Each job’s `--args` are comma-separated:
+• Merge takes only the GCS bucket
+• Clean takes bucket + master file pattern
+• Ingest takes bucket + cleaned master file path
 
-## F. Cloud Run Job Deployment
+## C. Build & Push
 
-a. Build & push your container (to `gcr.io/your-project-id/horse-data-ingestion:latest`)
+```powershell
+cd services/data_ingestion_service
 
-b. Create a Cloud Run job
-gcloud beta run jobs create horse-data-ingestion-job ^
-\--image=gcr.io/your-project-id/horse-data-ingestion\:latest ^
-\--region=europe-central2
+docker build `
+  --tag gcr.io/<PROJECT_ID>/data-ingestion-service:latest `
+  .
 
-c. Execute the job
-gcloud beta run jobs execute horse-data-ingestion-job ^
-\--region=europe-central2 ^
-\--args=horse-racing-data-elomack,horse\_data/horse\_data\_1\_to\_1000\_<timestamp>.ndjson
+docker push gcr.io/<PROJECT_ID>/data-ingestion-service:latest
+```
 
-## G. How It Works
+*or via Cloud Build*
 
-— Fetch main table metadata (schema & location)
-— Build staging schema by dropping the `updated_at` field
-— Create a transient staging table named `horse_records_staging_<timestamp>`
-— Launch a BigQuery load job via `bigquery.createJob()`, await `job.promise()`
-— Run a MERGE: upsert from staging into the main table, setting `updated_at = CURRENT_TIMESTAMP()`
-— Delete the transient staging table
+```powershell
+gcloud builds submit `
+  --tag gcr.io/<PROJECT_ID>/data-ingestion-service:latest
+```
 
-## H. Customizing
+## D. Execution
 
-— **Persist staging tables:** comment out the `delete()` call in `src/index.js`
-— **Use a permanent staging table:** replace the dynamic name with `horse_records_staging`, skip creation, and rely on `WRITE_TRUNCATE`
-— **Schema changes:** update your BigQuery table schema or adjust the `stagingSchema` in code
+— **Merge**
 
-## I. Contributing
+```powershell
+gcloud beta run jobs execute merge-job --region=<REGION>
+```
 
-— Fork the repository
-— Create a feature branch
-— Submit a pull request with clear descriptions and tests
+— **Clean**
 
-## J. License
+```powershell
+gcloud beta run jobs execute clean-master-job --region=<REGION>
+```
 
-MIT © Your Name
+— **Ingest**
+
+```powershell
+gcloud beta run jobs execute horse-ingestion-job --region=<REGION>
+```
+
+## E. Logs & Validation
+
+— **Cloud Run Jobs → Executions** shows each task’s stdout/stderr
+— Key log entries:
+ 🔍 “Cleaning & de-duping master file: gs\://…”
+ ✅ “Clean & de-dupe complete. Kept X rows”
+ “Started load job…”
+ “MERGE completed successfully.”
+
+— **BigQuery row count**:
+
+```bash
+bq query --nouse_legacy_sql \
+  'SELECT COUNT(*) FROM `horse-racing-predictor-<PROJECT_ID>.horse_racing_data.horse_records`'
+```
+
+Ensures final table matches your cleaned master file’s line count.
