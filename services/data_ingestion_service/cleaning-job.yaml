@@ -1,20 +1,33 @@
+# services/data_ingestion_service/cleaning-job.yaml
+
 apiVersion: run.googleapis.com/v1
 kind: Job
 metadata:
-  name: clean-master-job
+  name: clean-master-job            # Unique name of the Job
 spec:
-  template:
-    # First “template” level holds Job-wide settings
-    template:
-      # Second “template.spec” is exactly where containers + restartPolicy go
-      spec:
-        containers:
-          - image: gcr.io/horse-racing-predictor-465217/data-ingestion-service:latest
-            # override the ENTRYPOINT/CMD so we run our cleaning script
-            command:
-              - node
-              - src/cleanMaster.js
-            args:
-              - horse-racing-data-elomack
-              - horse_data/master_horse_data_2025-07-11_09:12:50.ndjson
-        restartPolicy: Never
+  template:                         # Job execution template
+    spec:                           # Execution-level settings
+      parallelism: 1                # How many tasks may run concurrently
+      taskCount: 1                  # Total number of tasks to perform
+
+      template:                     # Task template (defines each individual task)
+        spec:                       # Task-level settings
+          maxRetries: 3             # Retry a failed task up to 3×
+          timeoutSeconds: 600       # Kill any single attempt after 600s (10 min)
+
+          # If you need a custom service account, uncomment and set below:
+          # serviceAccountName: clean-master-sa@<PROJECT>.iam.gserviceaccount.com
+ 
+          containers:
+            - image: gcr.io/horse-racing-predictor-465217/data-ingestion-service:latest
+              # We always run our cleanMaster.js script
+              command:
+                - node
+                - src/cleanMaster.js
+
+              # Pass in the bucket name where the master file lives
+              env:
+                - name: BUCKET_NAME
+                  value: horse-racing-data-elomack
+                - name: MASTER_FILE
+                  value: ""   # (will be injected by your orchestrator override)

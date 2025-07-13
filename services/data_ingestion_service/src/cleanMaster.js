@@ -1,96 +1,130 @@
-// src/cleanMaster.js
+// services/data_ingestion_service/src/cleanMaster.js
 
 /**
- * Cleans and de-duplicates a master NDJSON file:
- *  - Drops malformed JSON rows
- *  - Keeps only the first record seen for each `id`
- *  - Uses streaming so it never loads the entire file into memory
+ * cleanMaster.js
+ *
+ * Cleans and de-duplicates a GCS-hosted NDJSON:
+ *  - Drops malformed JSON lines
+ *  - Drops duplicate records by `id`
+ *  - Streams everything so it never holds the full file in memory
+ *
+ * Expects two ENV vars:
+ *   BUCKET_NAME – the GCS bucket name
+ *   MASTER_FILE – path to the NDJSON within that bucket
  */
 
-const { Storage } = require("@google-cloud/storage");
-const readline = require("readline");
+import { Storage } from "@google-cloud/storage"; // GCS client
+import readline          from "readline";       // line-by-line reader
+import fs                from "fs";             // local file I/O
+import os                from "os";             // temp directory
+import path              from "path";           // file path utilities
 
+// ───────────────────────────────────────────────────
+// 1) Read & validate inputs from ENV
+// ───────────────────────────────────────────────────
+const bucketName = process.env.BUCKET_NAME;
+const inputPath  = process.env.MASTER_FILE;
+
+if (!bucketName || !inputPath) {
+  console.error(
+    "❌ Missing required env vars. Please set both:\n" +
+    `  BUCKET_NAME=${bucketName}\n` +
+    `  MASTER_FILE=${inputPath}`
+  );
+  process.exit(1);
+}
+
+console.log(`✅ Env vars OK:\n  BUCKET_NAME=${bucketName}\n  MASTER_FILE=${inputPath}`);
+
+// ───────────────────────────────────────────────────
+// 2) Instantiate GCS client
+// ───────────────────────────────────────────────────
 const storage = new Storage();
 
-async function cleanAndDedupe(bucketName, inputPath) {
-  const bucket = storage.bucket(bucketName);
-  const inputFile = bucket.file(inputPath);
+/**
+ * downloadAndClean()
+ *
+ * 1) Downloads the GCS file to local temp
+ * 2) Streams & filters it
+ * 3) Uploads cleaned result back to GCS under
+ *    the same folder, with `_cleaned_deduped_<timestamp>` suffix
+ */
+async function downloadAndClean() {
+  // A) Prepare local temp paths
+  const tmpDir       = os.tmpdir();
+  const localSource  = path.join(tmpDir, path.basename(inputPath));
+  const timestamp    = new Date().toISOString().replace(/[:.]/g, "_");
+  const baseName     = path.basename(inputPath, ".ndjson");
+  const cleanedName  = `${baseName}_cleaned_deduped_${timestamp}.ndjson`;
+  const localCleaned = path.join(tmpDir, cleanedName);
 
-  // Build cleaned+deduped filename
-  const timestamp = new Date()
-    .toISOString()
-    .replace(/[:.]/g, "_");
-  const outputPath =
-    inputPath.replace(".ndjson", "") + `_cleaned_deduped_${timestamp}.ndjson`;
-  const outputFile = bucket.file(outputPath);
+  // B) Download from GCS
+  console.log(`⬇️  Downloading gs://${bucketName}/${inputPath} → ${localSource}`);
+  await storage.bucket(bucketName).file(inputPath)
+    .download({ destination: localSource });
 
-  console.log(
-    `🔍 Cleaning & de-duping master file: gs://${bucketName}/${inputPath}`
-  );
-  console.log(`   → will write: gs://${bucketName}/${outputPath}`);
-
-  // Create a read stream + line-by-line interface
-  const readStream = inputFile.createReadStream();
-  const rl = readline.createInterface({ input: readStream, crlfDelay: Infinity });
-
-  // Create a GCS write stream for the cleaned output
-  const writeStream = outputFile.createWriteStream({
-    contentType: "application/x-ndjson",
+  // C) Stream & clean
+  console.log(`🔄 Streaming & cleaning…`);
+  const rl = readline.createInterface({
+    input: fs.createReadStream(localSource),
+    crlfDelay: Infinity
   });
 
-  // Track seen IDs
-  const seen = new Set();
-  let kept = 0,
-    droppedMalformed = 0,
-    droppedDupes = 0;
+  const seenIds   = new Set();
+  let total=0, kept=0, malformed=0, dupes=0;
+  const outStream = fs.createWriteStream(localCleaned);
 
-  // As each line comes in...
   for await (const line of rl) {
+    total++;
     if (!line.trim()) continue;
 
-    let obj;
+    let rec;
     try {
-      obj = JSON.parse(line);
-    } catch (e) {
-      droppedMalformed++;
+      rec = JSON.parse(line);
+    } catch {
+      malformed++;
       continue;
     }
 
-    const id = obj.id;
-    if (seen.has(id)) {
-      droppedDupes++;
+    if (!rec.id) {
+      // skip records without an `id`
+      continue;
+    }
+    if (seenIds.has(rec.id)) {
+      dupes++;
       continue;
     }
 
-    seen.add(id);
-    // Write the JSON back as a single line
-    writeStream.write(JSON.stringify(obj) + "\n");
+    seenIds.add(rec.id);
+    outStream.write(JSON.stringify(rec) + os.EOL);
     kept++;
   }
 
-  // Close out the write stream and wait for it to finish
+  // D) Finish write
   await new Promise((resolve, reject) => {
-    writeStream.end();
-    writeStream.on("finish", resolve);
-    writeStream.on("error", reject);
+    outStream.end();
+    outStream.on("finish", resolve);
+    outStream.on("error", reject);
   });
 
   console.log(
-    `✅ Clean & de-dupe complete. Kept ${kept} rows; dropped malformed: ${droppedMalformed}; duplicates: ${droppedDupes}`
+    `✅ Done. Processed ${total} lines: kept ${kept}; ` +
+    `malformed ${malformed}; duplicates ${dupes}`
   );
-  console.log(`▶️  Output file: gs://${bucketName}/${outputPath}`);
-  return outputPath;
+
+  // E) Upload cleaned back to GCS
+  const remoteCleanedPath = path.join(path.dirname(inputPath), cleanedName);
+  console.log(`⬆️  Uploading cleaned file → gs://${bucketName}/${remoteCleanedPath}`);
+  await storage.bucket(bucketName)
+    .upload(localCleaned, { destination: remoteCleanedPath });
+
+  console.log(`🎉 Cleaning pipeline complete.`);
 }
 
-// When run as standalone
-if (require.main === module) {
-  const [, , bucketName, filePath] = process.argv;
-  if (!bucketName || !filePath) {
-    console.error("Usage: node src/cleanMaster.js <bucketName> <filePath>");
-    process.exit(1);
-  }
-  cleanAndDedupe(bucketName, filePath).catch((err) => {
-    console.error("Fatal error cleaning master:", err);
-    process.exit(1);
-  });
-}
+// ───────────────────────────────────────────────────
+// 3) Execute and handle errors
+// ───────────────────────────────────────────────────
+downloadAndClean().catch(err => {
+  console.error("❌ cleanMaster.js failed:", err);
+  process.exit(1);
+});
