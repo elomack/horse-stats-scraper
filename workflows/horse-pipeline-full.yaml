@@ -1,0 +1,67 @@
+# ================================================================
+# workflows/horse-pipeline-full.yaml   (region: europe-central2)
+# End-to-end loop that calls the single-batch orchestrator function.
+# ================================================================
+main:
+  params:
+    - payload       # { startId: int, batchSize: int, maxBatches: int }
+
+  steps:
+    # -----------------------------------------------------------------
+    # [0] Build the base orchestrator URL with startId & batchSize
+    # -----------------------------------------------------------------
+    - build_base_url:
+        assign:
+          - orchUrl: >-
+              ${
+                "https://europe-central2-horse-racing-predictor-465217.cloudfunctions.net/orchestrator"
+                + "?startId="   + string(payload.startId)
+                + "&batchSize=" + string(payload.batchSize)
+              }
+
+    # -----------------------------------------------------------------
+    # [1] Optionally append &maxBatches if provided
+    # -----------------------------------------------------------------
+    - maybe_add_max:
+        switch:
+          - condition: ${ payload.maxBatches != null }
+            steps:
+              - append_max:
+                  assign:
+                    - orchUrl: >-
+                        ${ orchUrl
+                          + "&maxBatches="
+                          + string(payload.maxBatches) }
+
+    # -----------------------------------------------------------------
+    # [2] Invoke the orchestrator Function for one batch
+    #     • Use the pre-built orchUrl
+    #     • 300s timeout (matches function’s timeout)
+    #     • OIDC auth
+    # -----------------------------------------------------------------
+    - call_orchestrator:
+        call: http.get
+        args:
+          url: ${ orchUrl }
+          timeout: 300.0
+          auth:
+            type: OIDC
+        result: orchResp
+
+    # -----------------------------------------------------------------
+    # [3] Fail fast on non-200
+    # -----------------------------------------------------------------
+    - check_status:
+        switch:
+          - condition: ${ orchResp.statusCode != 200 }
+            steps:
+              - error_out:
+                  raise: >-
+                    ${ "Orchestrator call failed with status "
+                      + string(orchResp.statusCode) }
+
+    # -----------------------------------------------------------------
+    # [4] Return exactly what the orchestrator returned
+    # -----------------------------------------------------------------
+    - finish:
+        return: ${ orchResp.body }

@@ -2,11 +2,11 @@
   "name": "data_ingestion_service",
   "version": "1.0.0",
   "description": "Ingest horse data JSON files into BigQuery.",
-  "type": "commonjs",
+  "type": "module",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "clean": "node src/cleanMaster.js"
+    "clean": "node src/cleanMaster.cjs"
   },
   "dependencies": {
     "@google-cloud/bigquery": "^8.1.0",

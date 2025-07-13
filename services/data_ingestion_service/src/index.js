@@ -1,94 +1,174 @@
-// src/cleanMaster.cjs
+// services/data_ingestion_service/src/index.js
 
 /**
- * Cleans and de-duplicates a master NDJSON file:
- *  - Drops malformed JSON rows
- *  - Keeps only the first record seen for each `id`
+ * index.js
+ *
+ * Ingestion service for horse‐racing data.
+ *
+ * Steps:
+ *   1) Load NDJSON data from GCS into a BigQuery staging table
+ *   2) Perform a MERGE (upsert) from the staging table into the main table
+ *   3) Delete the transient staging table
+ *
+ * Usage:
+ *   node src/index.js <bucketName> <filePath>
  */
 
-const { Storage } = require("@google-cloud/storage");   // GCS client
-const readline = require("readline");                  // line-by-line reader
-const { Readable } = require("stream");                // to turn a string into a stream
+import { BigQuery } from '@google-cloud/bigquery';
+import { Storage  } from '@google-cloud/storage';
 
-// instantiate storage client
-const storage = new Storage();
+// ----------------------------------------------------------------------------
+// CONFIGURATION
+// ----------------------------------------------------------------------------
+const PROJECT_ID = 'horse-racing-predictor-465217';
+const DATASET_ID = 'horse_racing_data';
+const MAIN_TABLE = `${PROJECT_ID}.${DATASET_ID}.horse_records`;
 
-async function cleanAndDedupe(bucketName, inputPath) {
-  // ── 1) Locate bucket & file
-  const bucket = storage.bucket(bucketName);
-  const inputFile = bucket.file(inputPath);
+const bigquery = new BigQuery({ location: 'europe-central2' });
+const storage  = new Storage();
 
-  // ── 2) Build output path with timestamp suffix
-  const timestamp = new Date().toISOString().replace(/[:.]/g, "_");
-  const outputPath = inputPath
-    .replace(".ndjson", "")
-    + `_cleaned_deduped_${timestamp}.ndjson`;
-  const outputFile = bucket.file(outputPath);
+/**
+ * ingestHorseData
+ *
+ * @param {string} bucketName – GCS bucket (e.g. "horse-racing-data-elomack")
+ * @param {string} filePath   – Path to the cleaned NDJSON file within that bucket
+ */
+export async function ingestHorseData(bucketName, filePath) {
+  const gcsUri = `gs://${bucketName}/${filePath}`;
+  console.log(`📥 Starting ingestion for ${gcsUri}`);
 
-  console.log(`🔍 Cleaning & de-duping master file: gs://${bucketName}/${inputPath}`);
-  console.log(`   → will write: gs://${bucketName}/${outputPath}`);
+  // ──────────────────────────────────────────────────────────
+  // STEP 1: Load NDJSON into staging table
+  // ──────────────────────────────────────────────────────────
+  const stagingTableId = `horse_records_staging_${Date.now()}`;
+  console.log(`⏳ Creating staging table: ${DATASET_ID}.${stagingTableId}`);
+  const dataset = bigquery.dataset(DATASET_ID);
 
-  // ── 3) Download entire NDJSON, split into lines
-  const [buffer] = await inputFile.download();
-  const lines = buffer.toString().split("\n");
-  const rl = readline.createInterface({
-    input: Readable.from(lines)
-  });
+  const gcsFile     = storage.bucket(bucketName).file(filePath);
+  const loadOptions = {
+    sourceFormat:    'NEWLINE_DELIMITED_JSON',
+    writeDisposition:'WRITE_TRUNCATE', // overwrite existing
+    autodetect:      true
+  };
 
-  // ── 4) Iterate, parse JSON, drop bad or duplicate records
-  const seen = new Set();
-  let kept = 0, droppedMalformed = 0, droppedDupes = 0;
-  const outLines = [];
+  console.log(`🚚 Loading data into staging table: ${stagingTableId}`);
+  const [loadJobRes] = await dataset
+    .table(stagingTableId)
+    .load(gcsFile, loadOptions);
+  const loadJobId = loadJobRes.jobReference.jobId;
+  console.log(`   → Load job ${loadJobId} started`);
+  await bigquery.job(loadJobId).getMetadata();
+  console.log(`✅ Load job ${loadJobId} completed`);
 
-  for await (const line of rl) {
-    if (!line.trim()) continue;                   // skip empty lines
+  // ──────────────────────────────────────────────────────────
+  // STEP 2: Merge into main table (no correlated subqueries)
+  // ──────────────────────────────────────────────────────────
+  console.log(`🔄 Merging staging into main table: ${MAIN_TABLE}`);
 
-    let obj;
-    try {
-      obj = JSON.parse(line);                     // parse JSON
-    } catch {
-      droppedMalformed++;                         // count malformed
-      continue;
-    }
+  const mergeSql = `
+MERGE \`${MAIN_TABLE}\` T
+USING (
+  SELECT
+    id, name, gender, color, mother, motherId, father, fatherId,
+    trainer, breed, breeder, owner, dateOfBirth,
 
-    const id = obj.id;
-    if (seen.has(id)) {
-      droppedDupes++;                             // count duplicate
-      continue;
-    }
+    -- Transform career array:
+    ARRAY(
+      SELECT STRUCT(
+        elem.raceYear       AS raceYear,
+        ''                  AS raceName,
+        CAST(elem.prize AS STRING) AS prize,
+        ''                  AS otherDetails,
+        elem.horseAge       AS horseAge,
+        elem.raceType       AS raceType,
+        elem.raceCount      AS raceCount,
+        elem.raceWonCount   AS raceWonCount,
+        elem.racePrizeCount AS racePrizeCount
+      )
+      FROM UNNEST(career) AS elem
+    ) AS career_mapped,
 
-    seen.add(id);
-    outLines.push(JSON.stringify(obj));           // keep the record
-    kept++;
-  }
+    -- Transform races array:
+    ARRAY(
+      SELECT STRUCT(
+        elem.horseOrder       AS horseOrder,
+        elem.horseFinalPlace  AS horseFinalPlace,
+        CAST(elem.prizeAmount AS STRING) AS prizeAmount,
+        elem.prizeCurrency    AS prizeCurrency,
+        elem.jockeyFirstName  AS jockeyFirstName,
+        elem.jockeyLastName   AS jockeyLastName,
+        elem.jockeyWeight     AS jockeyWeight,
+        CAST(elem.trackDistance AS FLOAT64) AS trackDistance,
+        CAST(elem.temperature   AS FLOAT64) AS temperature,
+        elem.weather           AS weather,
+        elem.raceGroup         AS raceGroup,
+        elem.raceSubtype       AS raceSubtype,
+        elem.raceCategoryName  AS raceCategoryName,
+        elem.cityName          AS cityName,
+        elem.trackTypeName     AS trackTypeName
+      )
+      FROM UNNEST(races) AS elem
+    ) AS races_mapped
 
-  // ── 5) Save cleaned NDJSON back to GCS
-  await outputFile.save(outLines.join("\n"), {
-    contentType: "application/x-ndjson"
-  });
+  FROM \`${PROJECT_ID}.${DATASET_ID}.${stagingTableId}\`
+) S
+ON T.id = S.id
+WHEN MATCHED THEN
+  UPDATE SET
+    name        = S.name,
+    gender      = S.gender,
+    color       = S.color,
+    mother      = S.mother,
+    motherId    = S.motherId,
+    father      = S.father,
+    fatherId    = S.fatherId,
+    trainer     = S.trainer,
+    breed       = S.breed,
+    breeder     = S.breeder,
+    owner       = S.owner,
+    dateOfBirth = S.dateOfBirth,
+    career      = S.career_mapped,
+    races       = S.races_mapped,
+    updated_at  = CURRENT_TIMESTAMP()
+WHEN NOT MATCHED THEN
+  INSERT (
+    id, name, gender, color, mother, motherId, father, fatherId,
+    trainer, breed, breeder, owner, career, races, dateOfBirth, updated_at
+  )
+  VALUES (
+    S.id, S.name, S.gender, S.color, S.mother, S.motherId,
+    S.father, S.fatherId, S.trainer, S.breed, S.breeder, S.owner,
+    S.career_mapped, S.races_mapped, S.dateOfBirth, CURRENT_TIMESTAMP()
+  );
+`;
 
-  console.log(`✅ Clean & de-dupe complete. Kept ${kept} rows`);
-  console.log(`   Dropped malformed: ${droppedMalformed}; duplicates: ${droppedDupes}`);
-  console.log(`▶️  Output file: gs://${bucketName}/${outputPath}`);
+  const [mergeJob] = await bigquery.createQueryJob({ query: mergeSql });
+  console.log(`   → Merge job ${mergeJob.id} started`);
+  await mergeJob.promise();
+  console.log(`✅ Merge job ${mergeJob.id} completed`);
 
-  return outputPath;
+  // ──────────────────────────────────────────────────────────
+  // STEP 3: Clean up staging table
+  // ──────────────────────────────────────────────────────────
+  console.log(`🗑️  Deleting staging table: ${stagingTableId}`);
+  await dataset.table(stagingTableId).delete();
+  console.log(`✅ Staging table ${stagingTableId} deleted`);
+
+  console.log(`🎉 Ingestion for ${gcsUri} finished successfully`);
 }
 
-// ───────────────────────────────────────────────────
-// If invoked directly (not as a module), parse args and run:
-if (require.main === module) {
-  const [ , , bucketName, filePath ] = process.argv;
-
-  // Usage check
+// ──────────────────────────────────────────────────────────
+// CLI bootstrap for direct execution
+// ──────────────────────────────────────────────────────────
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const [, , bucketName, filePath] = process.argv;
   if (!bucketName || !filePath) {
-    console.error("Usage: node src/cleanMaster.cjs <bucketName> <filePath>");
+    console.error('❌ Usage: node src/index.js <bucketName> <filePath>');
     process.exit(1);
   }
-
-  // Run and handle errors
-  cleanAndDedupe(bucketName, filePath)
+  ingestHorseData(bucketName, filePath)
     .catch(err => {
-      console.error("Fatal error cleaning master:", err);
+      console.error('❌ Fatal error during ingestion:', err);
       process.exit(1);
     });
 }

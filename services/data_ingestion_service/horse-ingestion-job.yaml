@@ -1,0 +1,63 @@
+# services/data_ingestion_service/horse-ingestion-job.yaml
+
+apiVersion: run.googleapis.com/v1      # Cloud Run Jobs v1 API
+kind: Job                             # Defines a one-off batch Job
+
+metadata:
+  name: horse-ingestion-job           # Must match what your orchestrator invokes
+
+spec:
+  template:
+    spec:
+
+      # ────────────────────────────────────────────────
+      # We only need a single container execution
+      # ────────────────────────────────────────────────
+      parallelism: 1                   # At most 1 task at a time
+      taskCount: 1                     # Run exactly 1 task per execution
+
+      template:
+        spec:
+
+          # ────────────────────────────────────────────
+          # Retry & timeout configuration
+          # ────────────────────────────────────────────
+          maxRetries: 3                 # On failure, retry up to 3×
+          timeoutSeconds: 600           # Allow up to 10 minutes total
+
+          # ────────────────────────────────────────────
+          # Service account with BQ & Storage permissions
+          # ────────────────────────────────────────────
+          serviceAccountName: 550937617308-compute@developer.gserviceaccount.com
+
+          containers:
+            - image: gcr.io/horse-racing-predictor-465217/data-ingestion-service:latest  
+              # Your Node.js ingestion service image
+
+              # ─────────────────────────────────────────
+              # Override the container’s entrypoint:
+              #   1) “node”
+              #   2) path to your entrypoint script
+              # ─────────────────────────────────────────
+              command:
+                - node
+                - src/entrypoint.js
+
+              # ─────────────────────────────────────────
+              # Positional args to entrypoint.js:
+              #   [0] bucket name
+              #   [1] path to cleaned NDJSON
+              # ─────────────────────────────────────────
+              args:
+                - horse-racing-data-elomack  
+                  # GCS bucket where cleaned file lives
+                - horse_data/master_horse_data_2025-07-12_15:31:24_cleaned_deduped_2025-07-13T10_17_46_110Z.ndjson  
+                  # Cleaned file to ingest
+
+              # ─────────────────────────────────────────
+              # Resource limits (optional to adjust)
+              # ─────────────────────────────────────────
+              resources:
+                limits:
+                  cpu:    1000m   # 1 vCPU
+                  memory: 512Mi   # 512 MiB RAM

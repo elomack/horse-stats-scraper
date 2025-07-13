@@ -111,7 +111,10 @@ exports.mergeHorseData = async (req, res) => {
     );
 
     console.log(`🎉 mergeHorseData completed: ${masterName}`);
-    res.status(200).send(`Merged ${partialNames.length} files into ${masterName}`);
+    res.status(200).json({
+      mergedCount: partialNames.length,
+      masterFile: masterName
+    });
   } catch (err) {
     console.error('❌ mergeHorseData failed:', err);
     res.status(500).send('Merge failed: ' + err.message);

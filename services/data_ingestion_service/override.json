@@ -1,0 +1,14 @@
+{
+  "template": {
+    "spec": {
+      "containers": [
+        {
+          "env": [
+            { "name": "BUCKET_NAME", "value": "horse-racing-data-elomack" },
+            { "name": "MASTER_FILE",  "value": "horse_data/master_horse_data_2025-07-12_13:48:58.ndjson" }
+          ]
+        }
+      ]
+    }
+  }
+}
