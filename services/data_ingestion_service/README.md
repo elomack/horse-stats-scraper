@@ -1,119 +1,180 @@
 # Data Ingestion Service
 
-This service merges, cleans, de-duplicates, and ingests newline-delimited JSON (NDJSON) horse data into BigQuery via three Cloud Run Jobs.
+A Cloud Run–based service providing two Jobs that take a cleaned NDJSON “master file” in GCS and load it into BigQuery:
 
-## A. Structure
+1. **clean-master-job**  
+   - Streams & filters a raw NDJSON in GCS, dropping malformed lines and duplicate IDs  
+   - Writes out a cleaned, deduped NDJSON back to GCS with a timestamp suffix  
 
-— **src/index.js**  
- Loads a cleaned master NDJSON from GCS into BigQuery:  
- ∙ stages into a transient table  
- ∙ performs a MERGE upsert into `horse_records`  
- ∙ sets `updated_at = CURRENT_TIMESTAMP()`  
+2. **horse-ingestion-job**  
+   - Loads the cleaned NDJSON into a transient BigQuery staging table  
+   - MERGEs (upserts) staging into the production `horse_records` table  
+   - Deletes the staging table  
 
-— **src/cleanMaster.js**  
- Streams the master NDJSON from GCS, drops malformed JSON lines, removes duplicate `id` entries, and writes a cleaned/​deduped file back to GCS  
+---
 
-— **src/mergeMaster.js** (if separate)  
- Gathers all batch NDJSON files under `horse_data/`, concatenates them into a single `master_…ndjson`, and deletes the original batch files  
+## A. Repository Layout
 
-— **Dockerfile**  
- Builds a container image for all three jobs  
+```
 
-— **package.json**  
- CommonJS mode; dependencies on `@google-cloud/storage` and `@google-cloud/bigquery`
+services/data\_ingestion\_service/
+├── Dockerfile
+├── package.json        # "type": "module"; deps: @google-cloud/storage, @google-cloud/bigquery
+├── src/
+│   ├── cleanMaster.js  # Download→stream→filter→upload
+│   ├── entrypoint.js   # CLI wrapper for ingestion
+│   └── index.js        # ingestHorseData(bucket, filePath)
+├── cleaning-job.yaml   # Cloud Run Job spec for clean-master-job
+└── ingestion-job.yaml  # Cloud Run Job spec for horse-ingestion-job
 
-## B. Jobs & Usage
-
-— **Merge Job**  
-```powershell
-gcloud beta run jobs create merge-job `
-  --region=<REGION> `
-  --image=gcr.io/<PROJECT_ID>/data-ingestion-service:latest `
-  --command node `
-  --args=src/mergeMaster.js,horse-racing-data-<PROJECT_ID> `
-  --tasks=1 --memory=256Mi --task-timeout=600s
 ````
 
-— **Clean & Dedupe Job**
+---
 
-```powershell
-gcloud beta run jobs create clean-master-job `
-  --region=<REGION> `
-  --image=gcr.io/<PROJECT_ID>/data-ingestion-service:latest `
-  --command node `
-  --args=src/cleanMaster.js,horse-racing-data-<PROJECT_ID>,horse_data/master_*.ndjson `
-  --tasks=1 --memory=512Mi --task-timeout=600s
-```
+## B. cleanMaster.js
 
-— **Ingestion Job**
+- **Inputs:**  
+  - `BUCKET_NAME` (env var) – GCS bucket  
+  - `MASTER_FILE` (env var) – path to the raw NDJSON  
 
-```powershell
-gcloud beta run jobs create horse-ingestion-job `
-  --region=<REGION> `
-  --image=gcr.io/<PROJECT_ID>/data-ingestion-service:latest `
-  --command node `
-  --args=src/index.js,horse-racing-data-<PROJECT_ID>,horse_data/*.ndjson `
-  --tasks=1 --memory=512Mi --task-timeout=600s
-```
+- **Process:**  
+  1. Download `gs://BUCKET_NAME/MASTER_FILE` to a local temp file  
+  2. Stream it line by line:  
+     - skip blank lines  
+     - drop malformed JSON  
+     - drop duplicate `id` values  
+  3. Write cleaned lines to `…_cleaned_deduped_<timestamp>.ndjson` in temp  
+  4. Upload back to `gs://BUCKET_NAME/<same-folder>/…_cleaned_deduped_<timestamp>.ndjson`  
 
-Replace `<PROJECT_ID>` and `<REGION>` as needed. Each job’s `--args` are comma-separated:
-• Merge takes only the GCS bucket
-• Clean takes bucket + master file pattern
-• Ingest takes bucket + cleaned master file path
+- **Exit codes:**  
+  - `0` on success  
+  - nonzero on missing env or any I/O error  
 
-## C. Build & Push
+---
+
+## C. index.js + entrypoint.js
+
+- **`index.js`** exports `async function ingestHorseData(bucketName, filePath)` that:
+  1. Loads NDJSON from GCS (`NEWLINE_DELIMITED_JSON`) into a new staging table  
+  2. Runs a BigQuery `MERGE` to upsert into `horse_records`  
+  3. Deletes the staging table  
+- **`entrypoint.js`** handles `process.argv`, calls `ingestHorseData(...)`, and exits with code `0`/`1`.  
+
+---
+
+## D. Build & Push
 
 ```powershell
 cd services/data_ingestion_service
 
+# Build local Docker image
 docker build `
-  --tag gcr.io/<PROJECT_ID>/data-ingestion-service:latest `
+  --tag gcr.io/horse-racing-predictor-465217/data-ingestion-service:latest `
   .
 
-docker push gcr.io/<PROJECT_ID>/data-ingestion-service:latest
-```
+# Push to Container Registry
+docker push gcr.io/horse-racing-predictor-465217/data-ingestion-service:latest
 
-*or via Cloud Build*
-
-```powershell
+# (Or use Cloud Build)
 gcloud builds submit `
-  --tag gcr.io/<PROJECT_ID>/data-ingestion-service:latest
+  --tag gcr.io/horse-racing-predictor-465217/data-ingestion-service:latest
+````
+
+---
+
+## E. Deploy Jobs
+
+### 1. clean-master-job
+
+Make sure `cleaning-job.yaml` contains:
+
+```yaml
+apiVersion: run.googleapis.com/v1
+kind: Job
+metadata:
+  name: clean-master-job
+spec:
+  template:
+    spec:
+      parallelism: 1
+      taskCount: 1
+      template:
+        spec:
+          maxRetries: 3
+          timeoutSeconds: 600
+          containers:
+            - image: gcr.io/horse-racing-predictor-465217/data-ingestion-service:latest
+              command: ["node","src/cleanMaster.js"]
+              env:
+                - name: BUCKET_NAME
+                  value: horse-racing-data-elomack
+                - name: MASTER_FILE
+                  value: "<PLACEHOLDER_MASTER_FILE>"
 ```
 
-## D. Execution
-
-— **Merge**
-
-```powershell
-gcloud beta run jobs execute merge-job --region=<REGION>
+```bash
+# Replace the Job definition
+gcloud run jobs replace services/data_ingestion_service/cleaning-job.yaml \
+  --region=europe-central2
 ```
 
-— **Clean**
+### 2. horse-ingestion-job
 
-```powershell
-gcloud beta run jobs execute clean-master-job --region=<REGION>
+Edit `ingestion-job.yaml` so its container spec reads:
+
+```yaml
+          containers:
+            - image: gcr.io/horse-racing-predictor-465217/data-ingestion-service:latest
+              command: ["node","src/entrypoint.js"]
+              args:
+                - horse-racing-data-elomack
+                - "<PLACEHOLDER_CLEANED_FILE>"
 ```
 
-— **Ingest**
-
-```powershell
-gcloud beta run jobs execute horse-ingestion-job --region=<REGION>
+```bash
+# Replace the Job definition
+gcloud run jobs replace services/data_ingestion_service/ingestion-job.yaml \
+  --region=europe-central2
 ```
 
-## E. Logs & Validation
+---
 
-— **Cloud Run Jobs → Executions** shows each task’s stdout/stderr
-— Key log entries:
- 🔍 “Cleaning & de-duping master file: gs\://…”
- ✅ “Clean & de-dupe complete. Kept X rows”
- “Started load job…”
- “MERGE completed successfully.”
+## F. Execute Jobs
 
-— **BigQuery row count**:
+Once your YAMLs refer to the correct `<PLACEHOLDER_*>` values, you can execute:
+
+```bash
+# Clean & dedupe
+gcloud run jobs execute clean-master-job --region=europe-central2
+
+# Ingest into BigQuery
+gcloud run jobs execute horse-ingestion-job --region=europe-central2
+```
+
+---
+
+## G. Logs & Validation
+
+### Cloud Run Job logs
+
+```bash
+gcloud logging read \
+  'resource.type="cloud_run_job"
+   AND resource.labels.job_name="clean-master-job"' \
+  --limit=20 \
+  --format="table(timestamp,textPayload)"
+```
+
+and similarly for `horse-ingestion-job`.
+
+### BigQuery row count
 
 ```bash
 bq query --nouse_legacy_sql \
-  'SELECT COUNT(*) FROM `horse-racing-predictor-<PROJECT_ID>.horse_racing_data.horse_records`'
+  'SELECT COUNT(*) AS cnt 
+   FROM `horse-racing-predictor-465217.horse_racing_data.horse_records`'
 ```
 
-Ensures final table matches your cleaned master file’s line count.
+This should match the number of lines in your cleaned NDJSON.
+
+---

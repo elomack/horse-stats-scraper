@@ -1,48 +1,107 @@
 # Workflows
 
-This folder contains the IaC definitions and orchestration logic for your scraping pipeline.
+This directory holds the Cloud Workflows definitions and (optionally) Run-Job manifests that drive your end-to-end scrape → merge → clean → ingest pipeline.
+
+---
 
 ## A. Files
 
-- **job-full.yaml**  
-  A Kubernetes-style resource manifest for your Cloud Run Job `horse-data-scraper-job`.  
-  It captures the full spec (image, resources, retries, timeout) as deployed via `gcloud run jobs replace`.  
-  > **Note:** You only need this file if you want to manage your scraper job entirely via YAML and `kubectl`/`gcloud` apply. Otherwise the job is already configured and running in GCP.  
+| Filename                       | Purpose                                                                                           |
+| ------------------------------ | ------------------------------------------------------------------------------------------------- |
+| **job-full.yaml**              | (Optional) Cloud Run Job manifest for your `horse-data-scraper-job`—captures image, args, timeout, etc. |
+| **horse-pipeline-full.yaml**   | The main Cloud Workflows definition that:  
+1. Builds the orchestrator URL (startId, batchSize, maxBatches)  
+2. Calls the Orchestrator Cloud Function with a 600 s timeout & OIDC auth  
+3. Fails fast on non-200 responses  
+4. Returns the orchestrator’s JSON result |
+| **README.md**                  | This document.                                                                                   |
 
-- **scrape-and-merge.yaml**  
-  A Cloud Workflows definition that, in its current form:
-  1. Invokes the **Orchestrator** service (which in turn drives the full scrape → merge → clean → ingest pipeline)
-  2. Returns the Orchestrator’s HTTP response body to the caller  
-  > **Note:** This is a lightweight “trigger” workflow. If you have moved to calling the workflow directly from your Orchestrator function, you may not need this file any longer.
+> **Note:** We no longer use a separate “scrape-and-merge.yaml”—we invoke the Orchestrator directly via **horse-pipeline-full.yaml**.
 
-## B. When & How to Use
+---
 
-1. **Deploy or update the scraper job via YAML** (optional):  
-   ```bash
-   gcloud run jobs replace job-full.yaml --region=europe-central2
+## B. Deploy & Execute
+
+### 1. (Optional) Ensure your scraper Job matches `job-full.yaml`
+
+```bash
+gcloud run jobs replace job-full.yaml \
+  --region=europe-central2
 ````
 
-This ensures the Run Job matches the spec in `job-full.yaml`.
+### 2. Deploy or update the workflow
 
-2. **Deploy the Workflows definition**:
+```bash
+gcloud workflows deploy horse-pipeline-full \
+  --source=horse-pipeline-full.yaml \
+  --location=europe-central2 \
+  --description="End-to-end scrape → merge → clean → ingest orchestrator"
+```
 
-   ```bash
-   gcloud workflows deploy scrape-and-merge \
-     --source=scrape-and-merge.yaml \
-     --location=europe-central2 \
-     --description="Trigger the orchestrator service"
-   ```
+### 3. Kick off a run
 
-3. **Execute the workflow**:
+Pass your desired parameters (`startId`, `batchSize`, `maxBatches`) as JSON. For example:
 
-   ```bash
-   gcloud workflows run scrape-and-merge --location=europe-central2
-   ```
+```bash
+# From Cloud Shell (Linux syntax):
+exec_id=$(gcloud workflows run horse-pipeline-full \
+  --location=europe-central2 \
+  --data='{"startId":1,"batchSize":1000,"maxBatches":50}' \
+  --format="value(name)")
 
-   This will call your Orchestrator service endpoint and return its result.
+# Then watch its status:
+gcloud workflows executions describe "$exec_id" \
+  --location=europe-central2 \
+  --format="yaml(state,result)"
+```
 
-## C. Lifecycle
+---
 
-* If you **modify** your Cloud Run Job spec, update `job-full.yaml` and re-apply.
-* If you **change** orchestration logic (e.g. add polling, error-handling), edit `scrape-and-merge.yaml` and re-deploy the workflow.
-* You can remove `scrape-and-merge.yaml` entirely and invoke your Orchestrator function directly once you’re confident the end-to-end flow is stable.
+## C. Parameters
+
+* **startId** (int) – the first horse ID to fetch
+* **batchSize** (int) – number of horses per scraper batch
+* **maxBatches** (int) – how many scraper batches to run
+
+*All three are now **required** (no defaults in the workflow itself), so always supply them in your `--data` payload.*
+
+---
+
+## D. How It Fits Together
+
+```mermaid
+flowchart LR
+  A[Workflow: horse-pipeline-full] --> B[Orchestrator CF]
+  B --> C[Scraper Cloud Run Job<br/>(horse-data-scraper-job)]
+  C --> D[mergeHorseData CF]
+  D --> E[clean-master-job Cloud Run Job]
+  E --> F[horse-ingestion-job Cloud Run Job]
+  F --> B
+```
+
+1. **Workflow** builds URL & calls **Orchestrator**.
+2. **Orchestrator** runs N scraper batches sequentially.
+3. After scraping, it calls **mergeHorseData** to stitch shards.
+4. Next, it kicks off the **clean-master-job** to drop malformed/duplicate rows.
+5. Finally, it triggers **horse-ingestion-job** to load into BigQuery.
+6. The orchestrator returns a JSON summary of all operations.
+
+---
+
+## E. Lifecycle & Updates
+
+* **Modify scraper job spec?**
+  Edit `job-full.yaml` and `gcloud run jobs replace`.
+
+* **Change orchestration logic?**
+  Edit `horse-pipeline-full.yaml` and re-deploy with `gcloud workflows deploy`.
+
+* **Roll back or retire?**
+  You can disable or delete the workflow:
+
+  ```bash
+  gcloud workflows disable horse-pipeline-full --location=europe-central2
+  gcloud workflows delete horse-pipeline-full --location=europe-central2
+  ```
+
+---
