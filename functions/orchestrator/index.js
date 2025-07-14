@@ -1,7 +1,5 @@
-// =============================================================================
 // functions/orchestrator/index.js   (Node.js 20, 1st-gen Cloud Function)
-// Orchestrates a single scraper→merge→clean→ingest batch.
-// =============================================================================
+// Orchestrates N scraper → merge → clean → ingest batches.
 
 import express from 'express';
 import { Storage } from '@google-cloud/storage';
@@ -11,7 +9,7 @@ import axios from 'axios';
 const app = express();
 
 // ──────────────────────────────────────
-// Constants
+// Constants: project & region IDs, job/function names
 // ──────────────────────────────────────
 const PROJECT_ID      = 'horse-racing-predictor-465217';
 const REGION          = 'europe-central2';
@@ -30,39 +28,48 @@ app.get('/', async (req, res) => {
   console.log('🔔  Orchestrator invoked');
 
   // ────────────────────────────────────
-  // 1) Parse & validate query params (single batch)
+  // 1) Parse & validate query params (multi-batch)
   // ────────────────────────────────────
-  const startId   = parseInt(req.query.startId  ?? '1',    10);
-  const batchSize = parseInt(req.query.batchSize?? '1000', 10);
+  const startId    = parseInt(req.query.startId,    10);
+  const batchSize  = parseInt(req.query.batchSize,  10);
+  const maxBatches = parseInt(req.query.maxBatches, 10);
 
-  if ([startId, batchSize].some(n => !Number.isInteger(n) || n <= 0)) {
+  if ([startId, batchSize, maxBatches].some(n => !Number.isInteger(n) || n <= 0)) {
     return res
       .status(400)
-      .send('startId and batchSize must be positive integers');
+      .send('startId, batchSize and maxBatches must all be positive integers');
   }
-  console.log(`🛠  Params: startId=${startId} batchSize=${batchSize}`);
+  console.log(`🛠  Params: startId=${startId} batchSize=${batchSize} maxBatches=${maxBatches}`);
 
   try {
     // ────────────────────────────────────
-    // 2) Run one scraper batch
+    // 2) Run scraper batches sequentially
     // ────────────────────────────────────
-    const endId = startId + batchSize - 1;
-    console.log(`➡️  Batch: IDs ${startId}-${endId}`);
+    let currentStart = startId;
+    const scrapeOps  = [];
 
-    const [scrapeOp] = await jobsClient.runJob({
-      name: SCRAPER_JOB,
-      overrides: {
-        containerOverrides: [
-          { args: [ String(startId), String(batchSize) ] }
-        ]
-      }
-    });
-    console.log(`   ↪️  Operation ${scrapeOp.name} started; waiting…`);
-    await scrapeOp.promise();
-    console.log('✅  Scraper batch done');
+    for (let batchNum = 1; batchNum <= maxBatches; batchNum++) {
+      const endId = currentStart + batchSize - 1;
+      console.log(`➡️  Batch ${batchNum}: IDs ${currentStart}-${endId}`);
+
+      const [scrapeOp] = await jobsClient.runJob({
+        name: SCRAPER_JOB,
+        overrides: {
+          containerOverrides: [
+            { args: [ String(currentStart), String(batchSize) ] }
+          ]
+        }
+      });
+      console.log(`   ↪️  Operation ${scrapeOp.name} started; waiting…`);
+      await scrapeOp.promise();
+      console.log(`✅  Batch ${batchNum} done`);
+
+      scrapeOps.push(scrapeOp.name);
+      currentStart += batchSize;
+    }
 
     // ────────────────────────────────────
-    // 3) Merge partial shards into master file
+    // 3) Merge partial NDJSON shards
     // ────────────────────────────────────
     console.log('🔀  Invoking mergeHorseData Cloud Function');
     const mergeResp = await axios.post(MERGE_URL);
@@ -72,9 +79,9 @@ app.get('/', async (req, res) => {
     const masterFile = mergeResp.data.masterFile;
     console.log(`✔️  Merge complete: ${masterFile}`);
 
-    // ────────────────────────────────────────────────
-    // 4) Trigger clean-master-job and wait for it
-    // ────────────────────────────────────────────────
+    // ───────────────────────────────────────────────────
+    // 4) Trigger clean-master-job and wait
+    // ───────────────────────────────────────────────────
     console.log('🧹  Triggering clean-master-job');
     const [cleanOp] = await jobsClient.runJob({
       name: CLEAN_JOB,
@@ -104,7 +111,7 @@ app.get('/', async (req, res) => {
     const cleanedFiles = files
       .map(f => f.name)
       .filter(name => name.includes(CLEANED_PATTERN))
-      .sort();  // lexicographic = timestamp order
+      .sort();
     if (cleanedFiles.length === 0) {
       throw new Error('No cleaned files found');
     }
@@ -112,7 +119,7 @@ app.get('/', async (req, res) => {
     console.log(`✔️  Picked cleaned file: ${cleanedFile}`);
 
     // ───────────────────────────────────────────────────
-    // 6) Trigger ingestion job and wait for it
+    // 6) Trigger ingestion-job and wait
     // ───────────────────────────────────────────────────
     console.log('📥  Triggering ingestion job');
     const [ingestOp] = await jobsClient.runJob({
@@ -131,17 +138,18 @@ app.get('/', async (req, res) => {
     console.log('✅  Ingestion job done');
 
     // ────────────────────────────────────
-    // 7) Return a consolidated summary
+    // 7) Return consolidated summary
     // ────────────────────────────────────
     res.status(200).json({
       startId,
       batchSize,
+      maxBatches,
       masterFile,
       cleanedFile,
       operations: {
-        scrape:  scrapeOp.name,
-        clean:   cleanOp.name,
-        ingest:  ingestOp.name
+        scrapeBatches: scrapeOps,
+        clean:         cleanOp.name,
+        ingest:        ingestOp.name
       }
     });
 
