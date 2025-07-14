@@ -53,12 +53,12 @@ main:
     # -----------------------------------------------------------------
     - check_status:
         switch:
-          - condition: ${ orchResp.statusCode != 200 }
+          - condition: ${ orchResp.code != 200 }
             steps:
               - error_out:
                   raise: >-
                     ${ "Orchestrator call failed with status "
-                      + string(orchResp.statusCode) }
+                      + string(orchResp.code) }
 
     # -----------------------------------------------------------------
     # [4] Return exactly what the orchestrator returned
