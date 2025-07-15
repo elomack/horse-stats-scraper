@@ -1,67 +1,144 @@
-# ================================================================
 # workflows/horse-pipeline-full.yaml   (region: europe-central2)
-# End-to-end loop that calls the single-batch orchestrator function.
-# ================================================================
 main:
   params:
-    - payload       # { startId: int, batchSize: int, maxBatches: int }
+    - payload   # { startId:int, batchSize:int, maxBatches:int }
 
   steps:
-    # -----------------------------------------------------------------
-    # [0] Build the base orchestrator URL with startId & batchSize
-    # -----------------------------------------------------------------
-    - build_base_url:
+    # ───────────────────────────────────────────────
+    # [0] Define constants
+    # ───────────────────────────────────────────────
+    - init_vars:
         assign:
-          - orchUrl: >-
-              ${
-                "https://europe-central2-horse-racing-predictor-465217.cloudfunctions.net/orchestrator"
-                + "?startId="   + string(payload.startId)
-                + "&batchSize=" + string(payload.batchSize)
-              }
+          - projectId: "horse-racing-predictor-465217"
+          - region:    "europe-central2"
 
-    # -----------------------------------------------------------------
-    # [1] Optionally append &maxBatches if provided
-    # -----------------------------------------------------------------
-    - maybe_add_max:
-        switch:
-          - condition: ${ payload.maxBatches != null }
-            steps:
-              - append_max:
-                  assign:
-                    - orchUrl: >-
-                        ${ orchUrl
-                          + "&maxBatches="
-                          + string(payload.maxBatches) }
+    # ───────────────────────────────────────────────
+    # [1] Initialize an empty list for shard paths
+    # ───────────────────────────────────────────────
+    - init_shards:
+        assign:
+          - shards: []
 
-    # -----------------------------------------------------------------
-    # [2] Invoke the orchestrator Function for one batch
-    #     • Use the pre-built orchUrl
-    #     • 300s timeout (matches function’s timeout)
-    #     • OIDC auth
-    # -----------------------------------------------------------------
-    - call_orchestrator:
-        call: http.get
+    # ───────────────────────────────────────────────
+    # [2] For i in 1…maxBatches, call the scraper CF
+    # ───────────────────────────────────────────────
+    - batch_loop:
+        for:
+          value: i
+          range:
+            - 1
+            - ${ payload.maxBatches }
+          steps:
+            # Compute this batch’s start & end IDs
+            - compute_bounds:
+                assign:
+                  - start: ${ payload.startId + (i - 1) * payload.batchSize }
+                  - end:   ${ start + payload.batchSize - 1 }
+
+            # Build the CF URL
+            - build_url:
+                assign:
+                  - orchUrl: >-
+                      ${ "https://"
+                         + region + "-" + projectId
+                         + ".cloudfunctions.net/orchestrator"
+                         + "?startId="   + string(start)
+                         + "&batchSize=" + string(payload.batchSize)
+                      }
+
+            # Invoke the scraper-only orchestrator
+            - call_scraper:
+                call: http.get
+                args:
+                  url:     ${ orchUrl }
+                  timeout: 300.0
+                  auth:
+                    type: OIDC
+                result: orchResp
+
+            # Fail fast on non-200
+            - check_scrape:
+                switch:
+                  - condition: ${ orchResp.code != 200 }
+                    steps:
+                      - error_out:
+                          raise: >-
+                            ${ "Batch " + string(i)
+                               + " scraper failed: code="
+                               + string(orchResp.code) }
+
+            # Append the returned shard path
+            - append_shard:
+                assign:
+                  - shards: ${ list.concat(shards, [ orchResp.body.shardFile ]) }
+
+    # ───────────────────────────────────────────────
+    # [3] Merge all shards once
+    # ───────────────────────────────────────────────
+    - merge_step:
+        call: http.post
         args:
-          url: ${ orchUrl }
-          timeout: 300.0
+          url:  ${ "https://"
+                  + region + "-" + projectId
+                  + ".cloudfunctions.net/mergeHorseData" }
           auth:
             type: OIDC
-        result: orchResp
+          body:
+            shards: ${ shards }
+        result: mergeResp
 
-    # -----------------------------------------------------------------
-    # [3] Fail fast on non-200
-    # -----------------------------------------------------------------
-    - check_status:
+    # ───────────────────────────────────────────────
+    # [4] Validate merge response
+    # ───────────────────────────────────────────────
+    - check_merge:
         switch:
-          - condition: ${ orchResp.code != 200 }
+          - condition: ${ mergeResp.code != 200 }
             steps:
-              - error_out:
+              - merge_error:
                   raise: >-
-                    ${ "Orchestrator call failed with status "
-                      + string(orchResp.code) }
+                    ${ "Merge failed: code=" + string(mergeResp.code) }
 
-    # -----------------------------------------------------------------
-    # [4] Return exactly what the orchestrator returned
-    # -----------------------------------------------------------------
+    # ───────────────────────────────────────────────
+    # [5] Clean & de-dupe the merged master file
+    # ───────────────────────────────────────────────
+    - clean_step:
+        call: googleapis.run.v1.namespaces.jobs.run
+        args:
+          name:      ${ "namespaces/" + projectId + "/jobs/clean-master-job" }
+          location:  ${ region }
+          body:
+            overrides:
+              containerOverrides:
+                - env:
+                    - name: BUCKET_NAME
+                      value: horse-racing-data-elomack
+                    - name: MASTER_FILE
+                      value: ${ mergeResp.body.masterFile }
+        result: cleanOp
+
+    # ───────────────────────────────────────────────
+    # [6] Ingest cleaned data into BigQuery
+    # ───────────────────────────────────────────────
+    - ingest_step:
+        call: googleapis.run.v1.namespaces.jobs.run
+        args:
+          name:     ${ "namespaces/" + projectId + "/jobs/horse-ingestion-job" }
+          location: ${ region }
+          body:
+            overrides:
+              containerOverrides:
+                - args:
+                    # pass both bucket and the (merged) file path
+                    - horse-racing-data-elomack
+                    - ${ mergeResp.body.masterFile }
+        result: ingestOp
+
+    # ───────────────────────────────────────────────
+    # [7] Return everything
+    # ───────────────────────────────────────────────
     - finish:
-        return: ${ orchResp.body }
+        return:
+          shards:     ${ shards }
+          mergeInfo:  ${ mergeResp.body }
+          cleanJob:   ${ cleanOp }
+          ingestJob:  ${ ingestOp }
