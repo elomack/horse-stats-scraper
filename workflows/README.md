@@ -1,57 +1,57 @@
 # Workflows
 
-This directory holds the Cloud Workflows definitions and (optionally) Run-Job manifests that drive your end-to-end scrape → merge → clean → ingest pipeline.
+This directory holds the Cloud Workflows definition that drives your end-to-end scrape → merge → clean → ingest pipeline, plus (optionally) any Run-Job manifests you need.
 
 ---
 
 ## A. Files
 
-| Filename                       | Purpose                                                                                           |
-| ------------------------------ | ------------------------------------------------------------------------------------------------- |
-| **job-full.yaml**              | (Optional) Cloud Run Job manifest for your `horse-data-scraper-job`—captures image, args, timeout, etc. |
-| **horse-pipeline-full.yaml**   | The main Cloud Workflows definition that:  
-1. Builds the orchestrator URL (startId, batchSize, maxBatches)  
-2. Calls the Orchestrator Cloud Function with a 600 s timeout & OIDC auth  
-3. Fails fast on non-200 responses  
-4. Returns the orchestrator’s JSON result |
-| **README.md**                  | This document.                                                                                   |
-
-> **Note:** We no longer use a separate “scrape-and-merge.yaml”—we invoke the Orchestrator directly via **horse-pipeline-full.yaml**.
+| Filename                     | Purpose                                                                                                     |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| **job-full.yaml**            | (Optional) Cloud Run Job manifest for your `horse-data-scraper-job`—captures image, args, timeout, etc.     |
+| **horse-pipeline-full.yaml** | The Cloud Workflows definition that:  
+1. Defines `projectId` & `region` constants  
+2. Loops `i = 1…maxBatches`, calling the **Orchestrator** CF to fire one scraper batch and collect its shard path  
+3. Once loop completes, HTTP-POSTs the list of shards to `mergeHorseData` CF  
+4. Invokes `clean-master-job` via the Cloud Run Admin API to drop bad JSON & de-dupe  
+5. Invokes `horse-ingestion-job` via Run Admin API to load into BigQuery  
+6. Returns a summary of the shards, merge info, clean job, and ingest job |
+| **README.md**                | This document.                                                                                               |
 
 ---
 
 ## B. Deploy & Execute
 
-### 1. (Optional) Ensure your scraper Job matches `job-full.yaml`
+### 1. (Optional) Ensure your scraper job manifest is applied
 
-```bash
-gcloud run jobs replace job-full.yaml \
+```powershell
+gcloud run jobs replace job-full.yaml `
   --region=europe-central2
 ````
 
 ### 2. Deploy or update the workflow
 
-```bash
-gcloud workflows deploy horse-pipeline-full \
-  --source=horse-pipeline-full.yaml \
-  --location=europe-central2 \
+```powershell
+gcloud workflows deploy horse-pipeline-full `
+  --source="horse-pipeline-full.yaml" `
+  --location=europe-central2 `
   --description="End-to-end scrape → merge → clean → ingest orchestrator"
 ```
 
 ### 3. Kick off a run
 
-Pass your desired parameters (`startId`, `batchSize`, `maxBatches`) as JSON. For example:
+Pass **all** three required parameters (`startId`, `batchSize`, `maxBatches`) as JSON. For example:
 
-```bash
-# From Cloud Shell (Linux syntax):
-exec_id=$(gcloud workflows run horse-pipeline-full \
-  --location=europe-central2 \
-  --data='{"startId":1,"batchSize":1000,"maxBatches":50}' \
-  --format="value(name)")
+```powershell
+# From PowerShell:
+$execId = gcloud workflows run horse-pipeline-full `
+  --location=europe-central2 `
+  --data='{"startId":1,"batchSize":1000,"maxBatches":50}' `
+  --format="value(name)"
 
 # Then watch its status:
-gcloud workflows executions describe "$exec_id" \
-  --location=europe-central2 \
+gcloud workflows executions describe $execId `
+  --location=europe-central2 `
   --format="yaml(state,result)"
 ```
 
@@ -59,49 +59,63 @@ gcloud workflows executions describe "$exec_id" \
 
 ## C. Parameters
 
-* **startId** (int) – the first horse ID to fetch
-* **batchSize** (int) – number of horses per scraper batch
-* **maxBatches** (int) – how many scraper batches to run
+| Name           | Type | Description                                                 |
+| -------------- | ---- | ----------------------------------------------------------- |
+| **startId**    | int  | First horse ID to fetch                                     |
+| **batchSize**  | int  | Number of horses per scraper batch                          |
+| **maxBatches** | int  | Total scraper batches to run (collects `maxBatches` shards) |
 
-*All three are now **required** (no defaults in the workflow itself), so always supply them in your `--data` payload.*
+*All three are **required**—the workflow will error if any are omitted.*
 
 ---
 
-## D. How It Fits Together
+## D. How It Works
 
 ```mermaid
 flowchart LR
-  A[Workflow: horse-pipeline-full] --> B[Orchestrator CF]
-  B --> C[Scraper Cloud Run Job<br/>(horse-data-scraper-job)]
-  C --> D[mergeHorseData CF]
-  D --> E[clean-master-job Cloud Run Job]
-  E --> F[horse-ingestion-job Cloud Run Job]
-  F --> B
+  subgraph Workflow
+    A[init_vars: projectId, region] --> B[init_shards: []]
+    B --> C[batch_loop ⟳ N times]
+    C -->|http.get orchestrator CF| D[Orchestrator CF → scraper-only]
+    D -->|returns shardFile| E[append_shard → shards array]
+    E --> C
+    E --> F[merge_step → mergeHorseData CF (POST shards)]
+    F --> G[clean_step → clean-master-job Run Job]
+    G --> H[ingest_step → horse-ingestion-job Run Job]
+  end
 ```
 
-1. **Workflow** builds URL & calls **Orchestrator**.
-2. **Orchestrator** runs N scraper batches sequentially.
-3. After scraping, it calls **mergeHorseData** to stitch shards.
-4. Next, it kicks off the **clean-master-job** to drop malformed/duplicate rows.
-5. Finally, it triggers **horse-ingestion-job** to load into BigQuery.
-6. The orchestrator returns a JSON summary of all operations.
+1. **init\_vars** — set `projectId` & `region`.
+2. **init\_shards** — start with empty `shards` list.
+3. **batch\_loop** — for each batch `i`:
+
+   * Compute `start = startId + (i-1)*batchSize` and `end = start + batchSize - 1`
+   * Build the Orchestrator CF URL `?startId=…&batchSize=…`
+   * `http.get` the CF (which runs one scraper batch and returns `shardFile`)
+   * Append that path to `shards` via `list.concat()`
+4. **merge\_step** — `http.post` to `mergeHorseData` CF with `{ "shards": [...] }`
+5. **clean\_step** — invoke `clean-master-job` via Cloud Run Admin API with `BUCKET_NAME` & `MASTER_FILE` env-vars
+6. **ingest\_step** — invoke `horse-ingestion-job` via Cloud Run Admin API with `args: [ BUCKET_NAME, MASTER_FILE ]`
+7. **finish** — return an object containing:
+
+   * `shards`: array of all shard paths
+   * `mergeInfo`: response body from merge CF (includes `masterFile`)
+   * `cleanJob`: the Run Job execution resource
+   * `ingestJob`: the Run Job execution resource
 
 ---
 
-## E. Lifecycle & Updates
+## E. Updating & Lifecycle
 
-* **Modify scraper job spec?**
-  Edit `job-full.yaml` and `gcloud run jobs replace`.
+* **Change scraper image & args?**
+  Update `job-full.yaml` and re-run `gcloud run jobs replace`.
 
 * **Change orchestration logic?**
-  Edit `horse-pipeline-full.yaml` and re-deploy with `gcloud workflows deploy`.
+  Edit `horse-pipeline-full.yaml`, then re-deploy with `gcloud workflows deploy`.
 
-* **Roll back or retire?**
-  You can disable or delete the workflow:
+* **Disable or delete the workflow**:
 
-  ```bash
+  ```powershell
   gcloud workflows disable horse-pipeline-full --location=europe-central2
-  gcloud workflows delete horse-pipeline-full --location=europe-central2
+  gcloud workflows delete  horse-pipeline-full --location=europe-central2
   ```
-
----
